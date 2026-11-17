@@ -30,6 +30,11 @@ def round2(x: float) -> float | int:
     return int(value) if value.is_integer() else value
 
 
+def clamp_bounds(val: float | int) -> float | int:
+    """Clamps forecast CCU to valid non-negative range [0.01, 1e9]."""
+    return min(1e9, max(0.01, val))
+
+
 def weighted_quantile(sorted_vals: list[float], sorted_weights: list[float], total_w: float, p: float) -> float:
     """Computes quantile p from pre-sorted values and matching weights."""
     target = p * total_w
@@ -118,7 +123,7 @@ def forecast_case(case: dict, name: str) -> dict:
 
         # Enforce strict non-decreasing bounds within [0.01, 1e9]
         for k in range(len(q_vals)):
-            q_vals[k] = min(1e9, max(0.01, q_vals[k]))
+            q_vals[k] = clamp_bounds(q_vals[k])
             if k > 0 and q_vals[k] < q_vals[k - 1]:
                 q_vals[k] = q_vals[k - 1]
 
