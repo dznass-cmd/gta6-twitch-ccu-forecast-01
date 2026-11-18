@@ -4,7 +4,7 @@ Predicts Twitch CCU quantiles [0.05, 0.25, 0.50, 0.75, 0.95] for launch day (hou
 Optimized for minimum pinball loss under Python 3.13 standard library.
 """
 
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 import json
 import math
 import os
@@ -19,10 +19,10 @@ INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-Z = [-1.645, -0.674, 0.0, 0.674, 1.645]
+Z = [-1.860, -0.706, 0.0, 0.706, 1.860]
 LOG_V1_MIN = math.log(15000.0)
-LOG_V1_MAX = math.log(400000.0)
-RIDGE_LAMBDA = 0.8
+LOG_V1_MAX = math.log(900000.0)
+RIDGE_LAMBDA = 0.6
 
 
 def clip(val: float, lo: float, hi: float) -> float:
@@ -45,21 +45,10 @@ def clamp_bounds(val: float | int) -> float | int:
     return min(1e9, max(0.01, val))
 
 
-def is_us_edt(day_str: str) -> float:
-    """Returns 1.0 when day_str (YYYY-MM-DD) falls inside US Daylight Saving Time, else 0.0."""
-    year, month, day = map(int, day_str[:10].split("-"))
-    dt = date(year, month, day)
-    mar1 = date(year, 3, 1)
-    dst_start = mar1 + timedelta(days=(6 - mar1.weekday()) % 7 + 7)
-    nov1 = date(year, 11, 1)
-    dst_end = nov1 + timedelta(days=(6 - nov1.weekday()) % 7)
-    return 1.0 if dst_start <= dt < dst_end else 0.0
-
-
 def extract_pre_features(
-    hourly_map: dict[str, dict], day_start_dt: datetime, v1_val: float
-) -> tuple[float, float]:
-    """Extracts pre-checkpoint geometric-mean log ratios (log_dip for t=-6..-3, log_late for t=-2..-1)."""
+    hourly_map: dict[str, dict], day_start_dt: datetime, v1_val: float, ch1_val: float | None = None
+) -> tuple[float, float, float]:
+    """Extracts pre-checkpoint log viewer ratios (dip, late) and channel surge ratio (ch_late)."""
     eve_logs = []
     for offset in range(-6, -2):
         key = (day_start_dt + timedelta(hours=offset)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -69,16 +58,29 @@ def extract_pre_features(
     v_eve = math.exp(sum(eve_logs) / len(eve_logs)) if eve_logs else v1_val
 
     late_logs = []
+    late_ch_logs = []
     for offset in range(-2, 0):
         key = (day_start_dt + timedelta(hours=offset)).strftime("%Y-%m-%dT%H:%M:%SZ")
         pt = hourly_map.get(key)
         if pt is not None:
             late_logs.append(math.log(max(1.0, float(pt.get("viewers", 1)))))
+            ch_pt = pt.get("channels")
+            if ch_pt is not None and float(ch_pt) > 0.0:
+                late_ch_logs.append(math.log(float(ch_pt)))
     v_late = math.exp(sum(late_logs) / len(late_logs)) if late_logs else v1_val
+
+    if ch1_val is None:
+        pt0 = hourly_map.get(day_start_dt.strftime("%Y-%m-%dT%H:%M:%SZ"))
+        if pt0 is not None:
+            ch1_val = pt0.get("channels")
 
     log_dip = clip(math.log(v_eve / v1_val), -0.8, 1.5)
     log_late = clip(math.log(v_late / v1_val), -0.7, 0.8)
-    return log_dip, log_late
+    if ch1_val is not None and float(ch1_val) > 0.0 and late_ch_logs:
+        ch_late = clip(math.log(float(ch1_val)) - (sum(late_ch_logs) / len(late_ch_logs)), -0.8, 1.0)
+    else:
+        ch_late = 0.0
+    return log_dip, log_late, ch_late
 
 
 def weighted_quantile(vals: list[float], weights: list[float], p: float) -> float:
@@ -127,13 +129,14 @@ def invert_matrix(mat: list[list[float]]) -> list[list[float]]:
     return [row[n:] for row in aug]
 
 
-def select_comparables(case: dict, v1: float) -> tuple[list[dict], tuple[float, float, float, float]]:
+def select_comparables(
+    case: dict, v1: float, ch1: float | None = None
+) -> tuple[list[dict], tuple[float, float, float, float]]:
     """Filters and weights comparables and returns target feature tuple."""
     ds_target = str(case.get("day_start", ""))[:10]
     ds_target_dt = datetime.fromisoformat(ds_target + "T00:00:00+00:00")
     hh_map = {h.get("from"): h for h in case.get("history_hourly", [])}
-    t_dip, t_late = extract_pre_features(hh_map, ds_target_dt, v1)
-    t_edt = is_us_edt(ds_target)
+    t_dip, t_late, t_ch_late = extract_pre_features(hh_map, ds_target_dt, v1, ch1)
     t_v1_cap = clip(math.log(v1), LOG_V1_MIN, LOG_V1_MAX)
 
     notes_str = (str(case.get("notes", "")) + " " + str(case.get("game", {}).get("name", ""))).lower()
@@ -161,10 +164,13 @@ def select_comparables(case: dict, v1: float) -> tuple[list[dict], tuple[float, 
         v1_comp = max(1.0, float(pts[0].get("viewers", 1)))
         peak_comp = max(float(pt.get("viewers", 0)) for pt in pts)
         is_rolling = ("rolling" in unlock_text) or ("midnight local" in unlock_text)
+        has_campaign_ea = "campaign early access" in unlock_text
 
         if case_is_rolling:
             if "early-access-contaminated" in unlock_text or (
-                "early access" in unlock_text and "no early access" not in unlock_text
+                "early access" in unlock_text
+                and "no early access" not in unlock_text
+                and not has_campaign_ea
             ):
                 continue
             if "tier: weak" in unlock_text:
@@ -181,38 +187,37 @@ def select_comparables(case: dict, v1: float) -> tuple[list[dict], tuple[float, 
 
         c_v1_cap = clip(math.log(v1_comp), LOG_V1_MIN, LOG_V1_MAX)
         dv1 = t_v1_cap - c_v1_cap
-        w = math.exp(-0.5 * (dv1 / 1.8) ** 2)
+        w = math.exp(-0.5 * (dv1 / 1.5) ** 2)
 
         if target_console_only and ("pc" not in plat_text):
-            w *= 3.5
+            w *= 2.5
         if is_rolling:
             w *= 2.0
+        if has_campaign_ea:
+            w *= 0.60
         if ("pc" in plat_text and (
             "simultaneous" in unlock_text or "single global" in unlock_text or "single time" in unlock_text
         )) or ("pc unlock later" in unlock_text):
             w *= 0.25
 
-        c_dip, c_late = extract_pre_features(cmap, ds_dt, v1_comp)
-        c_edt = is_us_edt(ds)
+        c_dip, c_late, c_ch_late = extract_pre_features(cmap, ds_dt, v1_comp, pts[0].get("channels"))
         valid_launches.append({
             "v1": v1_comp,
             "pts": pts,
             "w": max(1e-6, w),
             "dip": c_dip,
             "late": c_late,
-            "edt": c_edt,
+            "ch_late": c_ch_late,
             "v1_cap": c_v1_cap,
         })
 
-    return valid_launches, (t_dip, t_late, t_edt, t_v1_cap)
+    return valid_launches, (t_dip, t_late, t_ch_late, t_v1_cap)
 
 
-def block_features(h: int, dip: float, late: float, edt: float, v1_cap: float) -> list[float]:
+def block_features(h: int, dip: float, late: float, ch_late: float, v1_cap: float) -> list[float]:
     """Returns horizon-block feature vector with leading unpenalized intercept."""
     if h <= 4:
-        return [1.0, late, dip]
-    if h <= 7:
-        return [1.0, dip, edt, v1_cap]
+        return [1.0, late, ch_late]
     return [1.0, dip, v1_cap]
 
 
@@ -233,9 +238,9 @@ def estimate_hour_location_scale(
         sig = max(0.05, (q75 - q25) / 1.349, 0.04 * math.sqrt(max(1, h - 1)))
         return med, sig
 
-    t_dip, t_late, t_edt, t_v1_cap = target_feats
-    xt = block_features(h, t_dip, t_late, t_edt, t_v1_cap)
-    X = [block_features(h, vl["dip"], vl["late"], vl["edt"], vl["v1_cap"]) for vl in valid_launches]
+    t_dip, t_late, t_ch_late, t_v1_cap = target_feats
+    xt = block_features(h, t_dip, t_late, t_ch_late, t_v1_cap)
+    X = [block_features(h, vl["dip"], vl["late"], vl["ch_late"], vl["v1_cap"]) for vl in valid_launches]
 
     p_dim = len(xt)
     n = len(valid_launches)
@@ -271,15 +276,14 @@ def estimate_hour_location_scale(
         loo_res.append((ys[i] - yhat_i) / denom)
 
     med_res = weighted_quantile(loo_res, ws, 0.50)
-    med_raw = weighted_quantile(ys, ws, 0.50)
-    mu_h = 0.90 * (mu_ridge + med_res) + 0.10 * med_raw
+    mu_h = mu_ridge + med_res
 
     abs_dev = [abs(r - med_res) for r in loo_res]
     mad = weighted_quantile(abs_dev, ws, 0.50) * 1.4826
     q25 = weighted_quantile(loo_res, ws, 0.25)
     q75 = weighted_quantile(loo_res, ws, 0.75)
     iqr_sig = max(0.04, (q75 - q25) / 1.349)
-    sig_h = 0.95 * max(0.05, 0.5 * mad + 0.5 * iqr_sig, 0.03 * math.sqrt(max(1, h - 1)))
+    sig_h = max(0.05, 0.5 * mad + 0.5 * iqr_sig, 0.03 * math.sqrt(max(1, h - 1)))
     return mu_h, sig_h
 
 
@@ -293,7 +297,8 @@ def forecast_case(case: dict, name: str) -> dict:
         raise ValueError(f"{name} has no hour-1 print")
 
     v1 = max(1.0, float(first.get("viewers", 1)))
-    valid_launches, target_feats = select_comparables(case, v1)
+    ch1 = first.get("channels")
+    valid_launches, target_feats = select_comparables(case, v1, ch1)
 
     mus: dict[int, float] = {}
     raw_sigs: dict[int, float] = {}
@@ -305,12 +310,38 @@ def forecast_case(case: dict, name: str) -> dict:
             mus[h] = 0.0
             raw_sigs[h] = 0.15 * math.sqrt(max(1, h - 1))
 
-    # [0.25, 0.50, 0.25] temporal smoothing across hours 2..24
+    # Intra-hour h=1 momentum adjustment (active on minute-level h00 when >= 20 reads exist in h=1)
+    ds_target = str(case.get("day_start", ""))[:10]
+    if ds_target:
+        ds_target_dt = datetime.fromisoformat(ds_target + "T00:00:00+00:00")
+        h1_end_dt = ds_target_dt + timedelta(hours=1)
+        h1_points = []
+        for pt in case.get("history", []):
+            at_str = pt.get("at")
+            v_pt = pt.get("viewers")
+            if not at_str or v_pt is None:
+                continue
+            at_dt = datetime.fromisoformat(str(at_str).replace("Z", "+00:00"))
+            if ds_target_dt <= at_dt < h1_end_dt:
+                h1_points.append((at_dt, max(1.0, float(v_pt))))
+        if len(h1_points) >= 20:
+            h1_points.sort(key=lambda item: item[0])
+            tail_n = max(5, len(h1_points) // 4)
+            v_tail = sum(v for _, v in h1_points[-tail_n:]) / tail_n
+            intra = clip(math.log(v_tail / v1), -0.35, 0.35)
+            mus[2] += 0.35 * intra
+            mus[3] += 0.15 * intra
+
+    # Gaussian temporal smoothing across hours 2..24 (bw_h = 2.5)
     smooth_sigs: dict[int, float] = {}
     for h in range(2, 25):
-        s_prev = raw_sigs[h - 1] if h > 2 else raw_sigs[h]
-        s_next = raw_sigs[h + 1] if h < 24 else raw_sigs[h]
-        smooth_sigs[h] = 0.25 * s_prev + 0.50 * raw_sigs[h] + 0.25 * s_next
+        w_sum = 0.0
+        s_sum = 0.0
+        for hp in range(2, 25):
+            w_h = math.exp(-0.5 * ((h - hp) / 2.5) ** 2)
+            w_sum += w_h
+            s_sum += w_h * raw_sigs[hp]
+        smooth_sigs[h] = s_sum / w_sum
 
     hours_rows = []
     for row in case.get("forecast", []):
