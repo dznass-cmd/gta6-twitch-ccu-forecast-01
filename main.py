@@ -1,4 +1,4 @@
-"""gta6-twitch-ccu-forecast-01: Weighted Block Ridge with Sherman-Morrison LOO and Decoupled Tail Calibration."""
+"""gta6-twitch-ccu-forecast-01: Round 5 Weighted Block Ridge with Sherman-Morrison LOO and Decoupled Tail Calibration."""
 
 from datetime import datetime, timedelta, timezone
 import json
@@ -17,10 +17,10 @@ OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 LOG_V1_MIN = math.log(15000.0)
 LOG_V1_MAX = math.log(900000.0)
-RIDGE_EARLY = 1.0
+RIDGE_EARLY = 0.8
 RIDGE_LATE = 0.5
-BW_V1 = 1.8
-W_CONSOLE = 2.0
+BW_V1 = 1.7
+W_CONSOLE = 2.2
 BW_SMOOTH = 1.5
 BW_TAIL_POOL = 2.0
 TAIL_BASE_Z = 1.96
@@ -428,16 +428,16 @@ def forecast_case(case: dict, name: str) -> dict:
             zlo = min(-TAIL_BASE_Z, TAIL_EMP_MIX * q05_e + (1.0 - TAIL_EMP_MIX) * (-TAIL_BASE_Z))
             zhi = max(+TAIL_BASE_Z, TAIL_EMP_MIX * q95_e + (1.0 - TAIL_EMP_MIX) * (+TAIL_BASE_Z))
             lev_ratio = min(6.0, h_lev[h]) / max(2.0, n_eff)
-            tail_mult = math.sqrt(1.0 + 0.75 * lev_ratio) * (1.0 + 0.50 / max(2.0, n_eff))
+            tail_mult = math.sqrt(1.0 + 0.40 * lev_ratio) * (1.0 + 0.35 / max(2.0, n_eff))
             offsets = [
                 zlo * sig_h * tail_mult,
-                -0.48 * sig_h,
+                -0.44 * sig_h,
                 0.0,
                 0.48 * sig_h,
                 zhi * sig_h * tail_mult,
             ]
         else:
-            offsets = [-TAIL_BASE_Z * sig_h, -0.48 * sig_h, 0.0, 0.48 * sig_h, TAIL_BASE_Z * sig_h]
+            offsets = [-TAIL_BASE_Z * sig_h, -0.44 * sig_h, 0.0, 0.48 * sig_h, TAIL_BASE_Z * sig_h]
 
         q_vals = [clip_output_bounds(round_half_up_2(v1 * math.exp(mus[h] + off))) for off in offsets]
         for k in range(1, len(q_vals)):
